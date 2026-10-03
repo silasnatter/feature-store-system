@@ -2,7 +2,7 @@
 
 A small feature store built to understand the moving parts: an offline store in PostgreSQL, an online store in Redis, point-in-time correct training sets, and a serving API.
 
-Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join is in progress. The online store and the API do not exist yet.
+Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join works. The online store and the API do not exist yet.
 
 ## Setup
 
