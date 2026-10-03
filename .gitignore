@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
+
+# Data
+data/
+
+# ML
+mlruns/
+mlflow_data/
+
+# IDE
+.idea/
+*.swp
+.DS_Store
