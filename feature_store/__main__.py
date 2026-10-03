@@ -3,6 +3,7 @@
 python -m feature_store apply
 python -m feature_store compute --view user_purchase_stats --as-of 2026-06-01
 python -m feature_store backfill --view user_purchase_stats --start 2026-01-02 --end 2026-09-28
+python -m feature_store materialize --view user_purchase_stats --as-of 2026-09-28
 """
 
 import argparse
@@ -11,6 +12,7 @@ from datetime import UTC, date, datetime
 from feature_store import definitions
 from feature_store.compute import backfill, compute_features
 from feature_store.db import connect
+from feature_store.online import connect_redis, materialize
 from feature_store.registry import FeatureRegistry
 
 
@@ -35,6 +37,10 @@ def main() -> None:
     fill.add_argument("--start", required=True, type=date.fromisoformat)
     fill.add_argument("--end", required=True, type=date.fromisoformat)
 
+    online = commands.add_parser("materialize", help="copy the latest values of a view to Redis")
+    online.add_argument("--view", required=True)
+    online.add_argument("--as-of", type=_as_of, default=None, help="default: now")
+
     args = parser.parse_args()
     with connect() as conn:
         if args.command == "apply":
@@ -46,6 +52,10 @@ def main() -> None:
         elif args.command == "backfill":
             written = backfill(conn, args.view, args.start, args.end)
             print(f"{args.view} {args.start} to {args.end}: {written:,} values written")
+        elif args.command == "materialize":
+            as_of = args.as_of or datetime.now(UTC)
+            entities = materialize(conn, connect_redis(), args.view, as_of)
+            print(f"{args.view} as of {as_of.isoformat()}: {entities:,} entities in Redis")
 
 
 if __name__ == "__main__":
