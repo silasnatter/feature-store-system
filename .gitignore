@@ -20,3 +20,4 @@ mlflow_data/
 .idea/
 *.swp
 .DS_Store
+.vscode/
