@@ -1,7 +1,14 @@
 import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -70,3 +77,41 @@ columns = model[:-1].get_feature_names_out()
 weights = model[-1].coef_[0]
 for column, weight in sorted(zip(columns, weights, strict=True), key=lambda pair: -abs(pair[1])):
     print(f"  {column:<45} {weight:+.2f}")
+
+# Model 2: gradient boosting. It builds 100 small decision trees one after the
+# other; each tree is a series of yes/no questions about the features ("more
+# than 3 views last week?") and corrects the mistakes of the trees before it.
+# Trees decide for themselves where missing values go and only compare values
+# against thresholds, so no filling and no scaling is needed.
+boosted = HistGradientBoostingClassifier()
+boosted.fit(X_train, y_train)
+
+boosted_probabilities = boosted.predict_proba(X_test)[:, 1]
+report("Model 2: gradient boosting", boosted.predict(X_test), boosted_probabilities)
+
+# Did a model memorise the training rows? If its score on the rows it learned
+# from is clearly higher than on the test rows, it has (this is overfitting).
+print("\nROC AUC on training rows vs test rows")
+for name, fitted in [("logistic regression", model), ("gradient boosting", boosted)]:
+    train_auc = roc_auc_score(y_train, fitted.predict_proba(X_train)[:, 1])
+    test_auc = roc_auc_score(y_test, fitted.predict_proba(X_test)[:, 1])
+    print(f"  {name:<20} train {train_auc:.3f}  test {test_auc:.3f}")
+
+
+def precision_at_recall(scores, wanted_recall):
+    """The best precision reachable with a cut-off that still catches this share of buyers."""
+    precision, recall, _ = precision_recall_curve(y_test, scores)
+    return precision[recall >= wanted_recall].max()
+
+
+# A fair comparison: the default cut-off of 0.5 gives every model a different
+# recall. Here each one is set to catch the same share of buyers as baseline 2,
+# and we look at how often its "will buy" is right.
+baseline_recall = recall_score(y_test, ordered_recently)
+print(f"\nPrecision when catching {baseline_recall:.0%} of buyers")
+for name, scores in [
+    ("baseline 2", test["order_count_30d"]),
+    ("logistic regression", probabilities),
+    ("gradient boosting", boosted_probabilities),
+]:
+    print(f"  {name:<20} {precision_at_recall(scores, baseline_recall):.3f}")

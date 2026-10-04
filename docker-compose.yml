@@ -31,6 +31,25 @@ services:
       timeout: 5s
       retries: 10
 
+  # Experiment tracking and model registry.
+  # Port 5001 on the host: 5000 is taken by AirPlay Receiver on macOS.
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v3.16.1  # keep in step with the mlflow version in uv.lock
+    command: >
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --artifacts-destination /mlflow/artifacts
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
 volumes:
   postgres_data:
   redis_data:
+  mlflow_data:

@@ -5,6 +5,7 @@ python -m feature_store compute --view user_purchase_stats --as-of 2026-06-01
 python -m feature_store backfill --view user_purchase_stats --start 2026-01-02 --end 2026-09-28
 python -m feature_store materialize --view user_purchase_stats --as-of 2026-09-28
 python -m feature_store training-set --start 2026-02-01 --end 2026-08-01 --out data/training_set.csv
+python -m feature_store train --start 2026-02-01 --end 2026-08-01 --test-from 2026-07-01
 """
 
 import argparse
@@ -13,7 +14,9 @@ from pathlib import Path
 
 from feature_store import definitions
 from feature_store.compute import backfill, compute_features
+from feature_store.config import get_settings
 from feature_store.db import connect
+from feature_store.modeling import MODEL_FEATURES, train_and_register
 from feature_store.online import connect_redis, materialize
 from feature_store.registry import FeatureRegistry
 from feature_store.training import build_training_set, monthly_snapshots
@@ -49,6 +52,11 @@ def main() -> None:
     training.add_argument("--end", required=True, type=date.fromisoformat)
     training.add_argument("--out", required=True, type=Path)
 
+    train = commands.add_parser("train", help="train the purchase model and store it in MLflow")
+    train.add_argument("--start", required=True, type=date.fromisoformat)
+    train.add_argument("--end", required=True, type=date.fromisoformat)
+    train.add_argument("--test-from", required=True, type=_as_of, help="first test snapshot")
+
     args = parser.parse_args()
     with connect() as conn:
         if args.command == "apply":
@@ -71,6 +79,14 @@ def main() -> None:
             args.out.parent.mkdir(parents=True, exist_ok=True)
             frame.to_csv(args.out, index=False)
             print(f"{len(frame):,} rows from {len(snapshots)} snapshots written to {args.out}")
+        elif args.command == "train":
+            snapshots = monthly_snapshots(args.start, args.end)
+            frame = build_training_set(conn, snapshots, MODEL_FEATURES)
+            result = train_and_register(frame, args.test_from, get_settings().mlflow_tracking_uri)
+            print(f"Trained on {result.train_rows:,} rows, tested on {result.test_rows:,}")
+            for name, value in result.metrics.items():
+                print(f"  {name:<15} {value:.3f}")
+            print(f"Registered as purchase_model version {result.version}, now the champion")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 uvicorn feature_store.api:app --reload
 """
 
+import os
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -11,12 +12,28 @@ from typing import Annotated
 import psycopg
 import redis
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from mlflow.exceptions import MlflowException
+from psycopg.types.json import Jsonb
 from pydantic import AwareDatetime, BaseModel, Field
 
+from feature_store.config import get_settings
 from feature_store.db import create_pool
 from feature_store.historical import get_historical_features
+from feature_store.modeling import (
+    MODEL_FEATURES,
+    MODEL_NAME,
+    MODEL_VIEW,
+    LoadedModel,
+    load_champion,
+    predict_purchase,
+)
 from feature_store.online import connect_redis, read_entity
 from feature_store.registry import FeatureRegistry, NotRegisteredError
+
+# By default MLflow retries an unreachable server for about four minutes. An API
+# request must not hang that long, so give up quickly unless configured otherwise.
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
+os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "5")
 
 
 @asynccontextmanager
@@ -42,8 +59,25 @@ def get_redis(request: Request) -> redis.Redis:
     return request.app.state.redis
 
 
+def get_model(request: Request) -> LoadedModel:
+    """The champion model, fetched from MLflow on first use and then kept in memory.
+
+    The feature endpoints work without a model, so it is not loaded at startup.
+    Restart the API to pick up a new champion.
+    """
+    model = getattr(request.app.state, "model", None)
+    if model is None:
+        try:
+            model = load_champion(get_settings().mlflow_tracking_uri)
+        except MlflowException as exc:
+            raise HTTPException(status_code=503, detail=f"No model available: {exc}") from exc
+        request.app.state.model = model
+    return model
+
+
 Conn = Annotated[psycopg.Connection, Depends(get_conn)]
 Redis = Annotated[redis.Redis, Depends(get_redis)]
+Model = Annotated[LoadedModel, Depends(get_model)]
 
 
 class EntityRow(BaseModel):
@@ -54,6 +88,10 @@ class EntityRow(BaseModel):
 class HistoricalRequest(BaseModel):
     entity_rows: list[EntityRow] = Field(max_length=10_000)
     features: list[str] = Field(min_length=1)
+
+
+class PredictRequest(BaseModel):
+    user_id: int
 
 
 @app.get("/health")
@@ -108,3 +146,42 @@ def historical_features(body: HistoricalRequest, conn: Conn):
     except NotRegisteredError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"rows": rows}
+
+
+@app.post("/predict")
+def predict(body: PredictRequest, conn: Conn, client: Redis, model: Model):
+    """The probability that a user orders in the next 30 days.
+
+    Features come from Redis, the model from MLflow. Every prediction is
+    logged to Postgres with the feature values the model saw.
+    """
+    row = read_entity(client, MODEL_VIEW, body.user_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No online features for user {body.user_id}")
+    # A feature without a stored value is None; the model fills the gap itself
+    features = {name: row.values.get(name) for name in MODEL_FEATURES}
+    probability = predict_purchase(model.pipeline, features)
+
+    conn.execute(
+        """
+        INSERT INTO feature_store.predictions
+            (model_name, model_version, entity_id, probability, features, features_as_of)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+        (
+            MODEL_NAME,
+            model.version,
+            body.user_id,
+            probability,
+            Jsonb(features),
+            row.event_timestamp,
+        ),
+    )
+    return {
+        "user_id": body.user_id,
+        "purchase_probability": probability,
+        "model": MODEL_NAME,
+        "model_version": model.version,
+        "features": features,
+        "features_as_of": row.event_timestamp,
+    }

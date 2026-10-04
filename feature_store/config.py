@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     redis_host: str = "localhost"
     redis_port: int = 6379
 
+    mlflow_tracking_uri: str = "http://localhost:5001"
+
     @property
     def postgres_dsn(self) -> str:
         return (

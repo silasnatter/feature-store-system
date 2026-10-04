@@ -1,8 +1,8 @@
 # Feature store from scratch
 
-A small feature store built to understand the moving parts: an offline store in PostgreSQL, an online store in Redis, point-in-time correct training sets, and a serving API.
+A small feature store built to understand the moving parts: an offline store in PostgreSQL, an online store in Redis, point-in-time correct training sets, a model registry in MLflow, and a serving API.
 
-Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join, the Redis online store and the HTTP API work. Model training, orchestration and monitoring do not exist yet.
+Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join, the Redis online store, model training with MLflow and the HTTP API, including predictions, work. Orchestration and monitoring do not exist yet.
 
 ## Setup
 
@@ -10,7 +10,7 @@ Requires Docker, [uv](https://docs.astral.sh/uv/) and Python 3.12 (uv installs i
 
 ```bash
 cp .env.example .env
-docker compose up -d                      # Postgres on 5432, Redis on 6379
+docker compose up -d                      # Postgres on 5432, Redis on 6379, MLflow on 5001
 uv sync
 uv run python -m feature_store.datagen    # fill the raw tables with synthetic events
 uv run pytest
@@ -47,6 +47,7 @@ uv run uvicorn feature_store.api:app --reload     # http://localhost:8000/docs
 |---|---|---|
 | `GET /features/online/{view}/{entity_id}` | Redis | Latest values for one entity, for predictions |
 | `POST /features/historical` | Postgres | Point-in-time correct values for training rows |
+| `POST /predict` | Redis, MLflow | Probability that a user orders in the next 30 days |
 | `GET /features` | Postgres | The active features in the registry |
 | `GET /health` | both | Checks that both stores answer |
 
@@ -55,6 +56,24 @@ curl localhost:8000/features/online/user_purchase_stats/9
 curl -X POST localhost:8000/features/historical -H 'content-type: application/json' \
   -d '{"entity_rows": [{"entity_id": 7, "event_timestamp": "2026-06-01T12:00:00Z"}], "features": ["order_count_30d"]}'
 ```
+
+## Training and predicting
+
+The model answers one question: will this user place an order in the next 30 days? Features are what was known at a snapshot date; the label is what happened in the 30 days after it.
+
+```bash
+uv run python -m feature_store train --start 2026-02-01 --end 2026-08-01 --test-from 2026-07-01
+```
+
+This builds a training set from the first of each month in the range (labels joined with point-in-time features), trains a logistic regression on the snapshots before `--test-from`, measures it on the rest, and stores the run and the model in MLflow (http://localhost:5001). The new model version gets the `champion` alias. Snapshots whose 30-day label window reaches past the end of the raw data are rejected.
+
+```bash
+curl -X POST localhost:8000/predict -H 'content-type: application/json' -d '{"user_id": 1727}'
+```
+
+`/predict` reads the user's features from Redis, applies the champion model and logs the prediction, with the feature values the model saw, to `feature_store.predictions`. The model is fetched from MLflow on the first request and kept in memory; restart the API to pick up a new champion. Without a reachable MLflow or a champion it answers 503, and the feature endpoints keep working.
+
+The scripts in `ml/` are the exploration behind the model: `explore.py` looks at the training set, `train.py` compares two baselines, a logistic regression and gradient boosting on `data/training_set.csv` (written by `python -m feature_store training-set`).
 
 ## Layout
 
@@ -68,9 +87,13 @@ feature_store/
   feature_sql/       One SQL file per feature view
   compute.py         Compute a view as of a moment; backfill a date range
   historical.py      Point-in-time join for training sets
+  label_sql/         One SQL file per label
+  training.py        Training sets: labels joined with point-in-time features
+  modeling.py        The purchase model: train, store in MLflow, load, predict
   online.py          Redis online store and materialisation
   api.py             FastAPI app
   __main__.py        Command line
+ml/                  Exploration scripts
 postgres/init/       Schema, applied on first container start
 tests/               pytest suite
 ```
