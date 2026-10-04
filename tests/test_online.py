@@ -7,6 +7,7 @@ from feature_store.online import (
     OnlineRow,
     latest_values,
     materialize,
+    materialized_until,
     read_online,
     write_online,
 )
@@ -157,8 +158,48 @@ def test_materialize_removes_entities_without_valid_values(conn, redis_client):
     store(conn, "spend", 1, day(1), 10.0)
     store(conn, "spend", 2, day(4), 70.0)
     materialize(conn, redis_client, VIEW, as_of=day(2))
-    assert redis_client.keys("*") == ["stats:1"]
+    assert redis_client.keys("stats:*") == ["stats:1"]
 
     materialize(conn, redis_client, VIEW, as_of=day(4))  # entity 1 has expired by now
 
-    assert redis_client.keys("*") == ["stats:2"]
+    assert redis_client.keys("stats:*") == ["stats:2"]
+
+
+def test_materialize_records_the_moment_it_copied(conn, redis_client):
+    store(conn, "spend", 1, day(2), 20.0)
+    assert materialized_until(redis_client, VIEW) is None
+
+    materialize(conn, redis_client, VIEW, as_of=day(2))
+
+    assert materialized_until(redis_client, VIEW) == day(2)
+
+
+def test_materialize_does_not_go_back_in_time(conn, redis_client):
+    store(conn, "spend", 1, day(1), 10.0)
+    store(conn, "spend", 1, day(2), 20.0)
+    materialize(conn, redis_client, VIEW, as_of=day(2))
+
+    written = materialize(conn, redis_client, VIEW, as_of=day(1))
+
+    assert written is None
+    assert read_online(redis_client, VIEW, 1, ["spend"]) == {"spend": 20.0}
+    assert materialized_until(redis_client, VIEW) == day(2)
+
+
+def test_materialize_the_same_moment_again_is_allowed(conn, redis_client):
+    store(conn, "spend", 1, day(2), 20.0)
+    materialize(conn, redis_client, VIEW, as_of=day(2))
+
+    assert materialize(conn, redis_client, VIEW, as_of=day(2)) == 1
+
+
+def test_materialize_with_force_goes_back_in_time(conn, redis_client):
+    store(conn, "spend", 1, day(1), 10.0)
+    store(conn, "spend", 1, day(2), 20.0)
+    materialize(conn, redis_client, VIEW, as_of=day(2))
+
+    written = materialize(conn, redis_client, VIEW, as_of=day(1), force=True)
+
+    assert written == 1
+    assert read_online(redis_client, VIEW, 1, ["spend"]) == {"spend": 10.0}
+    assert materialized_until(redis_client, VIEW) == day(1)

@@ -1,0 +1,8 @@
+# The Airflow image only needs the project's package and its dependency files
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!feature_store/
+**/__pycache__

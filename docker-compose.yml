@@ -35,10 +35,13 @@ services:
   # Port 5001 on the host: 5000 is taken by AirPlay Receiver on macOS.
   mlflow:
     image: ghcr.io/mlflow/mlflow:v3.16.1  # keep in step with the mlflow version in uv.lock
+    # allowed-hosts: the names MLflow accepts requests under. localhost is how
+    # your machine reaches it, mlflow:5000 how the other containers do.
     command: >
       mlflow server --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --artifacts-destination /mlflow/artifacts
+      --allowed-hosts localhost:*,127.0.0.1:*,mlflow:5000
     ports:
       - "5001:5000"
     volumes:
@@ -49,7 +52,49 @@ services:
       timeout: 5s
       retries: 20
 
+  # Scheduler and UI (http://localhost:8080). `airflow standalone` runs every
+  # Airflow component in one container, which is meant for local use only.
+  airflow:
+    build:
+      context: .
+      dockerfile: orchestration/Dockerfile
+    command: standalone
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # No login: everyone who can reach the UI is an admin
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+      # How the project's command line reaches the other containers
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-feature_store}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./orchestration/dags:/opt/airflow/dags:ro
+      # The project's code is read from the repo, so code changes need no rebuild.
+      # Rebuild only when dependencies change: docker compose build airflow
+      - ./feature_store:/opt/feature_store/feature_store:ro
+      - airflow_logs:/opt/airflow/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
 volumes:
   postgres_data:
   redis_data:
   mlflow_data:
+  airflow_logs:

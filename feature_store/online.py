@@ -8,6 +8,10 @@ Layout in Redis: one hash per entity and feature view.
             _event_timestamp      -> "2026-09-28T00:00:00+00:00"
 
 A feature whose value is null has no field in the hash.
+
+One extra key per view records the moment its values were last copied as of:
+
+    key     _materialized_until:user_purchase_stats  -> "2026-09-28T00:00:00+00:00"
 """
 
 from collections.abc import Sequence
@@ -39,6 +43,10 @@ def connect_redis(settings: Settings | None = None) -> redis.Redis:
 
 def online_key(view_name: str, entity_id: int) -> str:
     return f"{view_name}:{entity_id}"
+
+
+def watermark_key(view_name: str) -> str:
+    return f"_materialized_until:{view_name}"
 
 
 def write_online(client: redis.Redis, view_name: str, rows: Sequence[OnlineRow]) -> None:
@@ -136,14 +144,32 @@ def latest_values(conn: psycopg.Connection, view_name: str, as_of: datetime) -> 
     return list(rows.values())
 
 
+def materialized_until(client: redis.Redis, view_name: str) -> datetime | None:
+    """The moment the view's online values were last copied as of, or None if never."""
+    stored = client.get(watermark_key(view_name))
+    return datetime.fromisoformat(stored) if stored else None
+
+
 def materialize(
-    conn: psycopg.Connection, client: redis.Redis, view_name: str, as_of: datetime
-) -> int:
+    conn: psycopg.Connection,
+    client: redis.Redis,
+    view_name: str,
+    as_of: datetime,
+    force: bool = False,
+) -> int | None:
     """Copy the latest values of a view from Postgres to Redis.
 
     Entities that have no valid value any more are removed from Redis.
     Returns the number of entities written.
+
+    Redis only moves forward in time: if it already holds values as of a later
+    moment, nothing is written and None is returned, unless `force` is set.
+    This keeps a re-run or backfill of an old date from replacing newer values.
     """
+    current_until = materialized_until(client, view_name)
+    if current_until is not None and as_of < current_until and not force:
+        return None
+
     rows = latest_values(conn, view_name, as_of)
     write_online(client, view_name, rows)
 
@@ -151,4 +177,5 @@ def materialize(
     stale = [key for key in client.scan_iter(match=f"{view_name}:*") if key not in current]
     if stale:
         client.delete(*stale)
+    client.set(watermark_key(view_name), as_of.isoformat())
     return len(rows)
