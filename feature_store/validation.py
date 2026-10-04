@@ -1,19 +1,40 @@
-"""Checks on a computed snapshot, run before it is copied to the online store."""
+"""Quality checks on a computed snapshot.
 
+Used twice: as a gate before values are copied to the online store
+(`validate_snapshot`), and by the monitor, which records every outcome.
+"""
+
+from dataclasses import dataclass
 from datetime import datetime
 
 import psycopg
 
 from feature_store.registry import FeatureRegistry
 
+OK = "ok"
+WARNING = "warning"
+ALERT = "alert"
 
-def validate_snapshot(conn: psycopg.Connection, view_name: str, as_of: datetime) -> list[str]:
-    """Problems with the values a view has for one moment; an empty list means none.
 
-    Per feature, against the thresholds in its definition:
-      - values must exist for that moment
-      - the share of nulls must not exceed `null_threshold`
-      - values must lie within `expected_min` and `expected_max`, where set
+@dataclass(frozen=True)
+class Check:
+    """The outcome of one check."""
+
+    name: str  # what was checked: a feature name or a model name
+    metric: str
+    value: float | None
+    status: str  # OK, WARNING or ALERT
+    message: str
+
+
+def quality_checks(conn: psycopg.Connection, view_name: str, as_of: datetime) -> list[Check]:
+    """Check the values a view has for one moment against its feature definitions.
+
+    Per feature:
+      - `row_count`: values must exist for that moment
+      - `null_share`: the share of nulls must not exceed `null_threshold`
+      - `minimum` and `maximum`: values must lie within `expected_min` and
+        `expected_max`, where those are set
     """
     FeatureRegistry(conn).get_view(view_name)  # raises if the view is unknown
     features = conn.execute(
@@ -38,31 +59,72 @@ def validate_snapshot(conn: psycopg.Connection, view_name: str, as_of: datetime)
     ).fetchall()
 
     if not features:
-        return [f"{view_name}: the view has no features"]
+        return [Check(view_name, "feature_count", 0, ALERT, "the view has no features")]
 
-    problems = []
+    checks = []
     for feature in features:
         name = feature["feature_name"]
-        if feature["n_values"] == 0:
-            problems.append(f"{name}: no values for {as_of.isoformat()}")
+        n_values = feature["n_values"]
+        if n_values == 0:
+            message = f"no values for {as_of.isoformat()}"
+            checks.append(Check(name, "row_count", 0, ALERT, message))
             continue
-        null_share = feature["n_null"] / feature["n_values"]
-        if null_share > feature["null_threshold"]:
-            problems.append(
-                f"{name}: {null_share:.1%} of values are null, "
-                f"allowed {feature['null_threshold']:.1%}"
+        checks.append(Check(name, "row_count", n_values, OK, f"{n_values:,} values"))
+
+        null_share = feature["n_null"] / n_values
+        checks.append(
+            Check(
+                name,
+                "null_share",
+                null_share,
+                ALERT if null_share > feature["null_threshold"] else OK,
+                f"{null_share:.1%} of values are null, allowed {feature['null_threshold']:.1%}",
             )
+        )
+
         # min and max are None when every value is null
-        if feature["expected_min"] is not None and feature["min_value"] is not None:
-            if feature["min_value"] < feature["expected_min"]:
-                problems.append(
-                    f"{name}: minimum {feature['min_value']:g} is below "
-                    f"the expected {feature['expected_min']:g}"
+        low, expected_low = feature["min_value"], feature["expected_min"]
+        if expected_low is not None and low is not None:
+            if low < expected_low:
+                check = Check(
+                    name,
+                    "minimum",
+                    low,
+                    ALERT,
+                    f"minimum {low:g} is below the expected {expected_low:g}",
                 )
-        if feature["expected_max"] is not None and feature["max_value"] is not None:
-            if feature["max_value"] > feature["expected_max"]:
-                problems.append(
-                    f"{name}: maximum {feature['max_value']:g} is above "
-                    f"the expected {feature['expected_max']:g}"
+            else:
+                check = Check(
+                    name, "minimum", low, OK, f"minimum {low:g}, expected at least {expected_low:g}"
                 )
-    return problems
+            checks.append(check)
+
+        high, expected_high = feature["max_value"], feature["expected_max"]
+        if expected_high is not None and high is not None:
+            if high > expected_high:
+                check = Check(
+                    name,
+                    "maximum",
+                    high,
+                    ALERT,
+                    f"maximum {high:g} is above the expected {expected_high:g}",
+                )
+            else:
+                check = Check(
+                    name,
+                    "maximum",
+                    high,
+                    OK,
+                    f"maximum {high:g}, expected at most {expected_high:g}",
+                )
+            checks.append(check)
+    return checks
+
+
+def validate_snapshot(conn: psycopg.Connection, view_name: str, as_of: datetime) -> list[str]:
+    """Problems with the values a view has for one moment; an empty list means none."""
+    return [
+        f"{check.name}: {check.message}"
+        for check in quality_checks(conn, view_name, as_of)
+        if check.status == ALERT
+    ]

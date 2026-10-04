@@ -3,10 +3,10 @@
 uvicorn feature_store.api:app --reload
 """
 
-import os
+import time
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
@@ -24,16 +24,20 @@ from feature_store.modeling import (
     MODEL_NAME,
     MODEL_VIEW,
     LoadedModel,
+    champion_info,
+    fail_fast,
     load_champion,
     predict_purchase,
 )
+from feature_store.monitoring import current_status
 from feature_store.online import connect_redis, read_entity
 from feature_store.registry import FeatureRegistry, NotRegisteredError
 
-# By default MLflow retries an unreachable server for about four minutes. An API
-# request must not hang that long, so give up quickly unless configured otherwise.
-os.environ.setdefault("MLFLOW_HTTP_REQUEST_MAX_RETRIES", "1")
-os.environ.setdefault("MLFLOW_HTTP_REQUEST_TIMEOUT", "5")
+# An API request must not hang for minutes when MLflow is down
+fail_fast()
+
+# How often to ask MLflow whether the champion has changed
+MODEL_REFRESH_SECONDS = 60
 
 
 @asynccontextmanager
@@ -60,18 +64,30 @@ def get_redis(request: Request) -> redis.Redis:
 
 
 def get_model(request: Request) -> LoadedModel:
-    """The champion model, fetched from MLflow on first use and then kept in memory.
+    """The champion model, kept in memory.
 
-    The feature endpoints work without a model, so it is not loaded at startup.
-    Restart the API to pick up a new champion.
+    It is fetched from MLflow on first use; the feature endpoints work without
+    a model, so it is not loaded at startup. After that, at most once every
+    MODEL_REFRESH_SECONDS, a cheap lookup checks whether the champion has
+    changed, and only then is the new one loaded. If MLflow cannot be reached,
+    the model already in memory keeps serving.
     """
-    model = getattr(request.app.state, "model", None)
-    if model is None:
-        try:
-            model = load_champion(get_settings().mlflow_tracking_uri)
-        except MlflowException as exc:
+    state = request.app.state
+    model = getattr(state, "model", None)
+    checked_at = getattr(state, "model_checked_at", None)
+    now = time.monotonic()
+    if model is not None and checked_at is not None and now - checked_at < MODEL_REFRESH_SECONDS:
+        return model
+
+    tracking_uri = get_settings().mlflow_tracking_uri
+    try:
+        if model is None or champion_info(tracking_uri).version != model.version:
+            model = load_champion(tracking_uri)
+    except MlflowException as exc:
+        if model is None:
             raise HTTPException(status_code=503, detail=f"No model available: {exc}") from exc
-        request.app.state.model = model
+    state.model = model
+    state.model_checked_at = now
     return model
 
 
@@ -185,3 +201,13 @@ def predict(body: PredictRequest, conn: Conn, client: Redis, model: Model):
         "features": features,
         "features_as_of": row.event_timestamp,
     }
+
+
+@app.get("/monitor/status")
+def monitor_status(conn: Conn, as_of: AwareDatetime | None = None):
+    """The health of every feature and of the model, by default as of now.
+
+    Quality, drift and model performance come from the latest recorded checks;
+    freshness is measured on the spot. The overall status is the worst one.
+    """
+    return current_status(conn, as_of or datetime.now(UTC))

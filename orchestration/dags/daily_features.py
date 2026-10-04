@@ -1,5 +1,8 @@
 """Daily feature pipeline: compute the day's feature values, check them, copy them to Redis.
 
+    compute --> validate --> materialize
+    compute --> monitor
+
 Every task calls the project's command line, which lives in its own virtualenv
 inside the Airflow image (see orchestration/Dockerfile). The commands are safe
 to run again for the same date, so a failed or repeated run does no harm.
@@ -56,4 +59,13 @@ with DAG(
         bash_command=f"{CLI} materialize --view {VIEW} --as-of {AS_OF}",
     )
 
+    # Records the quality and drift checks for the day. It only records: an
+    # alert shows up in the monitor log and the API, it does not fail the run.
+    # It does not wait for validate, so a failed check is recorded too.
+    monitor = BashOperator(
+        task_id="monitor",
+        bash_command=f"{CLI} monitor --view {VIEW} --as-of {AS_OF}",
+    )
+
     compute >> validate >> materialize
+    compute >> monitor

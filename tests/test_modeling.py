@@ -10,6 +10,7 @@ from feature_store.modeling import (
     MODEL_FEATURES,
     MODEL_NAME,
     build_pipeline,
+    champion_info,
     load_champion,
     predict_purchase,
     train_and_register,
@@ -29,29 +30,33 @@ INACTIVE = {
 }
 
 
-def training_frame() -> pd.DataFrame:
-    """Two snapshots of 40 users: active users buy, inactive ones do not."""
+def training_frame(misleading_training_labels: bool = False) -> pd.DataFrame:
+    """Two snapshots of 40 users: active users buy, inactive ones do not.
+
+    May is the training month, June the test month. With
+    `misleading_training_labels`, May says the opposite, so a model trained on
+    it does badly on June.
+    """
     rows = []
     for month in (5, 6):
         for user_id in range(40):
             features = ACTIVE if user_id % 2 == 0 else INACTIVE
+            # one user per group goes against the pattern, so the fit is not perfect
+            buys = (user_id % 2 == 0) != (user_id in (0, 1))
+            if misleading_training_labels and month == 5:
+                buys = not buys
             rows.append(
                 {
                     "entity_id": user_id,
                     "event_timestamp": datetime(2026, month, 1, tzinfo=UTC),
                     **features,
-                    # one user per group goes against the pattern, so the fit is not perfect
-                    "label": int((user_id % 2 == 0) != (user_id in (0, 1))),
+                    "label": int(buys),
                 }
             )
     return pd.DataFrame(rows)
 
 
-@pytest.fixture
-def tracking_uri(tmp_path, monkeypatch):
-    """A private MLflow store in a temporary directory, no server needed."""
-    monkeypatch.chdir(tmp_path)  # MLflow writes model files below the working directory
-    return f"sqlite:///{tmp_path / 'mlflow.db'}"
+JUNE = datetime(2026, 6, 1, tzinfo=UTC)
 
 
 def test_pipeline_handles_missing_values():
@@ -106,3 +111,54 @@ def test_split_that_leaves_one_side_empty_is_rejected(tracking_uri):
 def test_load_champion_without_a_registered_model_raises(tracking_uri):
     with pytest.raises(MlflowException):
         load_champion(tracking_uri)
+
+
+def test_training_stores_a_drift_reference_and_the_test_score_with_the_model(tracking_uri):
+    result = train_and_register(training_frame(), JUNE, tracking_uri)
+
+    model = load_champion(tracking_uri)
+
+    assert model.test_roc_auc == pytest.approx(result.metrics["roc_auc"])
+    assert set(model.reference) == set(MODEL_FEATURES)
+    # Half of the training users are inactive and have no order value
+    assert model.reference["avg_order_value_30d"]["shares"][-1] == pytest.approx(0.5)
+
+
+def test_champion_info_gives_the_same_facts_without_loading_the_model(tracking_uri):
+    result = train_and_register(training_frame(), JUNE, tracking_uri)
+
+    info = champion_info(tracking_uri)
+
+    assert info.version == result.version
+    assert info.test_roc_auc == pytest.approx(result.metrics["roc_auc"])
+    assert set(info.reference) == set(MODEL_FEATURES)
+
+
+def test_first_model_is_promoted_even_when_it_has_to_be_better(tracking_uri):
+    result = train_and_register(training_frame(), JUNE, tracking_uri, promote_if_better=True)
+
+    assert result.promoted
+    assert result.champion_roc_auc is None
+    assert load_champion(tracking_uri).version == result.version
+
+
+def test_model_that_is_not_better_does_not_replace_the_champion(tracking_uri):
+    first = train_and_register(training_frame(), JUNE, tracking_uri)
+
+    # Same data, so the same model: equal, not better
+    second = train_and_register(training_frame(), JUNE, tracking_uri, promote_if_better=True)
+
+    assert not second.promoted
+    assert second.version != first.version  # it is still stored as a version
+    assert second.champion_roc_auc == pytest.approx(second.metrics["roc_auc"])
+    assert load_champion(tracking_uri).version == first.version
+
+
+def test_better_model_replaces_the_champion(tracking_uri):
+    train_and_register(training_frame(misleading_training_labels=True), JUNE, tracking_uri)
+
+    better = train_and_register(training_frame(), JUNE, tracking_uri, promote_if_better=True)
+
+    assert better.promoted
+    assert better.metrics["roc_auc"] > better.champion_roc_auc
+    assert load_champion(tracking_uri).version == better.version

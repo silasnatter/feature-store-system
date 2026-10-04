@@ -4,8 +4,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from feature_store.api import app, get_conn, get_redis
+from feature_store.monitoring import log_checks
 from feature_store.online import materialize
 from feature_store.registry import FeatureDefinition, FeatureRegistry, FeatureView
+from feature_store.validation import Check
 
 VIEW = "stats"
 
@@ -132,3 +134,36 @@ def test_historical_rejects_timestamps_without_timezone(api):
     )
 
     assert response.status_code == 422
+
+
+def test_monitor_status_combines_logged_checks_with_freshness(api, conn):
+    """The fixture stored values for day 1 and day 2; both features are fresh for 24 hours."""
+    log_checks(conn, "feature", day(2), [Check("spend", "psi", 0.4, "alert", "drifted")])
+    log_checks(conn, "model", day(2), [Check("purchase_model", "roc_auc", 0.93, "ok", "good")])
+
+    response = api.get("/monitor/status", params={"as_of": "2026-03-02T06:00:00Z"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "alert"
+    spend = {check["metric"]: check for check in body["features"]["spend"]["checks"]}
+    assert spend["psi"]["status"] == "alert"
+    assert spend["psi"]["message"] == "drifted"
+    assert spend["freshness_hours"]["value"] == pytest.approx(6)
+    assert spend["freshness_hours"]["status"] == "ok"
+    assert body["features"]["clicks"]["status"] == "ok"
+    assert body["models"]["purchase_model"]["status"] == "ok"
+
+
+def test_monitor_status_defaults_to_now(api):
+    """Asked without a moment, it measures freshness against the clock: March is long ago."""
+    body = api.get("/monitor/status").json()
+
+    assert body["status"] == "alert"
+    (freshness,) = body["features"]["spend"]["checks"]
+    assert freshness["metric"] == "freshness_hours"
+    assert freshness["value"] > 24
+
+
+def test_monitor_status_rejects_a_moment_without_timezone(api):
+    assert api.get("/monitor/status", params={"as_of": "2026-03-02T06:00:00"}).status_code == 422

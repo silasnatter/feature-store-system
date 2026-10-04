@@ -10,6 +10,7 @@ from feature_store.api import app, get_conn, get_model, get_redis
 from feature_store.modeling import (
     MODEL_FEATURES,
     MODEL_VIEW,
+    ChampionInfo,
     LoadedModel,
     build_pipeline,
     predict_purchase,
@@ -134,3 +135,50 @@ def test_the_model_is_loaded_once_and_then_reused(client, model, monkeypatch):
     client.post("/predict", json={"user_id": 2})
 
     assert len(loads) == 1
+
+
+def test_a_new_champion_is_picked_up_without_a_restart(client, model, monkeypatch):
+    newer = LoadedModel(version="8", pipeline=model.pipeline)
+    champion = {"model": model}
+    monkeypatch.setattr(api, "load_champion", lambda tracking_uri: champion["model"])
+    monkeypatch.setattr(
+        api, "champion_info", lambda uri: ChampionInfo(champion["model"].version, None, None)
+    )
+    monkeypatch.setattr(api, "MODEL_REFRESH_SECONDS", 0)  # check on every request
+    monkeypatch.setattr(app.state, "model", None, raising=False)
+
+    before = client.post("/predict", json={"user_id": 1}).json()
+    champion["model"] = newer  # retraining promotes a new version
+    after = client.post("/predict", json={"user_id": 1}).json()
+
+    assert (before["model_version"], after["model_version"]) == ("7", "8")
+
+
+def test_the_champion_is_not_looked_up_again_within_the_refresh_interval(
+    client, model, monkeypatch
+):
+    lookups = []
+    monkeypatch.setattr(api, "load_champion", lambda tracking_uri: model)
+    monkeypatch.setattr(api, "champion_info", lambda uri: lookups.append(uri))
+    monkeypatch.setattr(app.state, "model", None, raising=False)
+
+    for _ in range(3):
+        assert client.post("/predict", json={"user_id": 1}).status_code == 200
+
+    assert lookups == []
+
+
+def test_the_model_in_memory_keeps_serving_when_mlflow_goes_down(client, model, monkeypatch):
+    def unreachable(tracking_uri):
+        raise MlflowException("connection refused")
+
+    monkeypatch.setattr(api, "load_champion", lambda tracking_uri: model)
+    monkeypatch.setattr(api, "MODEL_REFRESH_SECONDS", 0)
+    monkeypatch.setattr(app.state, "model", None, raising=False)
+    assert client.post("/predict", json={"user_id": 1}).status_code == 200
+
+    monkeypatch.setattr(api, "champion_info", unreachable)
+    response = client.post("/predict", json={"user_id": 1})
+
+    assert response.status_code == 200
+    assert response.json()["model_version"] == "7"

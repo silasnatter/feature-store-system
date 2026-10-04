@@ -40,3 +40,8 @@ CREATE TABLE IF NOT EXISTS feature_store.feature_values (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (feature_id, entity_id, event_timestamp)
 );
+
+-- For reading one whole snapshot of a feature ("all values as of this moment"),
+-- which validation, monitoring and materialisation do.
+CREATE INDEX IF NOT EXISTS idx_feature_values_feature_time
+    ON feature_store.feature_values (feature_id, event_timestamp);

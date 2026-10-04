@@ -1,8 +1,8 @@
 # Feature store from scratch
 
-A small feature store built to understand the moving parts: an offline store in PostgreSQL, an online store in Redis, point-in-time correct training sets, a model registry in MLflow, a serving API, and a daily pipeline in Airflow.
+A small feature store built to understand the moving parts: an offline store in PostgreSQL, an online store in Redis, point-in-time correct training sets, a model registry in MLflow, a serving API, a daily pipeline in Airflow, and monitoring with automatic retraining.
 
-Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join, the Redis online store, model training with MLflow, the HTTP API including predictions, and the daily Airflow pipeline work. Monitoring and automatic retraining do not exist yet.
+Status: raw event data, the feature registry, feature computation and backfill exist. The point-in-time join, the Redis online store, model training with MLflow, the HTTP API including predictions, the daily Airflow pipeline, and monitoring with automatic retraining work.
 
 ## Setup
 
@@ -53,6 +53,7 @@ Redis only moves forward in time: materialising as of an earlier moment than the
 | `POST /features/historical` | Postgres | Point-in-time correct values for training rows |
 | `POST /predict` | Redis, MLflow | Probability that a user orders in the next 30 days |
 | `GET /features` | Postgres | The active features in the registry |
+| `GET /monitor/status` | Postgres | Health of every feature and of the model |
 | `GET /health` | both | Checks that both stores answer |
 
 ```bash
@@ -75,7 +76,7 @@ This builds a training set from the first of each month in the range (labels joi
 curl -X POST localhost:8000/predict -H 'content-type: application/json' -d '{"user_id": 1727}'
 ```
 
-`/predict` reads the user's features from Redis, applies the champion model and logs the prediction, with the feature values the model saw, to `feature_store.predictions`. The model is fetched from MLflow on the first request and kept in memory; restart the API to pick up a new champion. Without a reachable MLflow or a champion it answers 503, and the feature endpoints keep working.
+`/predict` reads the user's features from Redis, applies the champion model and logs the prediction, with the feature values the model saw, to `feature_store.predictions`. The model is fetched from MLflow on the first request and kept in memory. At most once a minute the API asks MLflow whether the champion has changed and loads the new one if so, so a promoted model goes live without a restart. Without a reachable MLflow or a champion it answers 503, and the feature endpoints keep working; if MLflow goes down later, the model in memory keeps serving.
 
 The scripts in `ml/` are the exploration behind the model: `explore.py` looks at the training set, `train.py` compares two baselines, a logistic regression and gradient boosting on `data/training_set.csv` (written by `python -m feature_store training-set`).
 
@@ -85,11 +86,13 @@ Airflow (http://localhost:8080, no login) runs the DAG `daily_features` once per
 
 ```
 compute  ->  validate  ->  materialize
+compute  ->  monitor
 ```
 
 - `compute` stores the feature values as of midnight UTC of the run's date.
 - `validate` checks them against the thresholds in the feature definitions (values exist, share of nulls, expected range) and fails the run if they break one, so `materialize` never copies bad values to Redis.
 - `materialize` copies the latest values to Redis.
+- `monitor` records the day's quality and drift checks. It only records; an alert does not fail the run.
 
 Each task calls the same command line you can run by hand, for example `python -m feature_store validate --view user_purchase_stats --as-of 2026-09-28`. The commands are safe to repeat, so a failed run can simply be run again.
 
@@ -98,6 +101,40 @@ The DAG is paused when first created; unpause it in the UI. It then catches up o
 The Airflow container holds the project in its own virtualenv, separate from Airflow's packages. The code in `feature_store/` is mounted from the repo, so code changes take effect without a rebuild; after changing dependencies, run `docker compose build airflow`.
 
 If your Postgres volume was created before Airflow was added, create its database once: `docker compose exec postgres psql -U postgres -c "CREATE DATABASE airflow"`.
+
+## Monitoring and retraining
+
+Four things are watched:
+
+| What | How | Alert when |
+|---|---|---|
+| Quality | Values exist, share of nulls, expected range, per feature and day | A threshold in the feature definition is broken |
+| Freshness | Age of each feature's newest values | Older than the feature's `freshness_hours` |
+| Drift | Population stability index (PSI) of each model feature against the data the champion was trained on | PSI of 0.25 or more (warning from 0.1) |
+| Model | The champion's ROC AUC on the newest snapshot whose 30-day outcome is known | More than 0.03 below its score at training time |
+
+Every check is recorded in `feature_store.monitor_logs`. `GET /monitor/status` returns the latest outcome of each check and the worst one as the overall status; add `?as_of=2026-09-28T06:00:00Z` to ask about another moment than now. Because the generated data ends on 2026-09-28, the status as of now reports every feature as stale, which is true.
+
+The drift reference is stored with each model in MLflow when it is trained, so drift always means "different from what this champion learned from".
+
+The DAG `retrain_model` runs weekly:
+
+```
+check  ->  retrain
+```
+
+- `check` asks whether there is a reason to retrain: a feature with a drift alert, a champion that scores clearly worse than at training, or a champion without a drift reference. If there is none, the run stops there and both steps show as skipped.
+- `retrain` trains a new model and scores it and the champion on the same held-back snapshot. The new model becomes the champion only if its ROC AUC is higher. Otherwise it is kept as a version in MLflow and the champion stays.
+
+The same steps by hand:
+
+```bash
+uv run python -m feature_store monitor --view user_purchase_stats --as-of 2026-09-28
+uv run python -m feature_store retrain-needed --as-of 2026-09-27    # exit status 99: not needed
+uv run python -m feature_store retrain --as-of 2026-09-27
+```
+
+`retrain --as-of D` holds back the snapshot 30 days before D as the test set, and trains on the first of each month whose own 30-day outcome window closed before that snapshot.
 
 ## Layout
 
@@ -115,7 +152,9 @@ feature_store/
   training.py        Training sets: labels joined with point-in-time features
   modeling.py        The purchase model: train, store in MLflow, load, predict
   online.py          Redis online store and materialisation
-  validation.py      Checks on a snapshot before it goes online
+  validation.py      Quality checks on a snapshot; the gate before it goes online
+  monitoring.py      Drift, freshness, the check log and the status summary
+  retraining.py      Monitor against the champion, decide on retraining, retrain
   api.py             FastAPI app
   __main__.py        Command line
 ml/                  Exploration scripts

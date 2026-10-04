@@ -7,6 +7,9 @@ python -m feature_store validate --view user_purchase_stats --as-of 2026-09-28
 python -m feature_store materialize --view user_purchase_stats --as-of 2026-09-28
 python -m feature_store training-set --start 2026-02-01 --end 2026-08-01 --out data/training_set.csv
 python -m feature_store train --start 2026-02-01 --end 2026-08-01 --test-from 2026-07-01
+python -m feature_store monitor --view user_purchase_stats --as-of 2026-09-28
+python -m feature_store retrain-needed --as-of 2026-09-27
+python -m feature_store retrain --as-of 2026-09-27
 """
 
 import argparse
@@ -20,7 +23,11 @@ from feature_store.config import get_settings
 from feature_store.db import connect
 from feature_store.online import connect_redis, materialize, materialized_until
 from feature_store.registry import FeatureRegistry
-from feature_store.validation import validate_snapshot
+from feature_store.validation import OK, validate_snapshot
+
+# `retrain-needed` exits with this status when no retraining is needed. Airflow is
+# told to read it as "skip the rest" rather than as a failure.
+NOT_NEEDED_EXIT_CODE = 99
 
 
 def _as_of(value: str) -> datetime:
@@ -64,6 +71,22 @@ def main() -> None:
     train.add_argument("--start", required=True, type=date.fromisoformat)
     train.add_argument("--end", required=True, type=date.fromisoformat)
     train.add_argument("--test-from", required=True, type=_as_of, help="first test snapshot")
+
+    monitor = commands.add_parser("monitor", help="record quality and drift checks for a snapshot")
+    monitor.add_argument("--view", required=True)
+    monitor.add_argument("--as-of", required=True, type=_as_of)
+
+    needed = commands.add_parser(
+        "retrain-needed",
+        help=f"exit 0 if the model should be retrained, {NOT_NEEDED_EXIT_CODE} if not",
+    )
+    needed.add_argument("--as-of", required=True, type=_as_of)
+
+    retrain = commands.add_parser("retrain", help="train a new model; promote it if it is better")
+    retrain.add_argument("--as-of", required=True, type=_as_of)
+    retrain.add_argument(
+        "--start", type=date.fromisoformat, default=date(2026, 2, 1), help="first training month"
+    )
 
     args = parser.parse_args()
     with connect() as conn:
@@ -119,6 +142,45 @@ def main() -> None:
                 for name, value in result.metrics.items():
                     print(f"  {name:<15} {value:.3f}")
                 print(f"Registered as purchase_model version {result.version}, now the champion")
+        elif args.command in ("monitor", "retrain-needed", "retrain"):
+            # Imported here for the same reason: these need MLflow and scikit-learn
+            from feature_store import retraining
+            from feature_store.modeling import fail_fast
+
+            tracking_uri = get_settings().mlflow_tracking_uri
+            if args.command == "monitor":
+                fail_fast()  # an unreachable MLflow should cost seconds, not minutes
+                checks, note = retraining.monitor_features(
+                    conn, args.view, args.as_of, tracking_uri
+                )
+                flagged = [check for check in checks if check.status != OK]
+                print(
+                    f"{args.view} as of {args.as_of.isoformat()}: "
+                    f"{len(checks)} checks recorded, {len(flagged)} not ok"
+                )
+                for check in flagged:
+                    print(f"  {check.status}: {check.name}: {check.message}")
+                if note:
+                    print(f"  {note}")
+            elif args.command == "retrain-needed":
+                reasons = retraining.retrain_reasons(conn, args.as_of, tracking_uri)
+                if not reasons:
+                    print(f"As of {args.as_of.isoformat()}: no retraining needed")
+                    conn.commit()  # keep the recorded checks; sys.exit would roll them back
+                    sys.exit(NOT_NEEDED_EXIT_CODE)
+                print(f"As of {args.as_of.isoformat()}: retraining needed")
+                for reason in reasons:
+                    print(f"  {reason}")
+            else:
+                result = retraining.retrain(conn, args.as_of, args.start, tracking_uri)
+                print(f"Trained on {result.train_rows:,} rows, tested on {result.test_rows:,}")
+                print(f"  new version {result.version}: ROC AUC {result.metrics['roc_auc']:.4f}")
+                if result.champion_roc_auc is not None:
+                    print(f"  champion on the same rows: ROC AUC {result.champion_roc_auc:.4f}")
+                if result.promoted:
+                    print(f"Version {result.version} is the new champion")
+                else:
+                    print(f"Version {result.version} is not better; the champion stays")
 
 
 if __name__ == "__main__":

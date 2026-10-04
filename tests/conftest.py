@@ -1,9 +1,11 @@
 import os
+import shutil
 from pathlib import Path
 
 import psycopg
 import pytest
 import redis
+from mlflow import MlflowClient
 from psycopg.rows import dict_row
 
 from feature_store.config import Settings
@@ -63,3 +65,19 @@ def redis_client():
     yield client
     client.flushdb()
     client.close()
+
+
+@pytest.fixture(scope="session")
+def mlflow_template(tmp_path_factory):
+    """An empty MLflow database, made once: setting one up takes several seconds."""
+    path = tmp_path_factory.mktemp("mlflow") / "mlflow.db"
+    MlflowClient(f"sqlite:///{path}").search_experiments()  # creates the tables
+    return path
+
+
+@pytest.fixture
+def tracking_uri(mlflow_template, tmp_path, monkeypatch):
+    """A private, empty MLflow store in a temporary directory; no server needed."""
+    monkeypatch.chdir(tmp_path)  # MLflow writes model files below the working directory
+    shutil.copy(mlflow_template, tmp_path / "mlflow.db")
+    return f"sqlite:///{tmp_path / 'mlflow.db'}"
